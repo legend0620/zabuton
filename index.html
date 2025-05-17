@@ -1,0 +1,246 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" content="width=device-width,initial-scale=1.0,maximum-scale=1.0,user-scalable=no">
+<title>座布団積みゲーム</title>
+<style>
+  html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#f0f0f0;}
+  #loader{position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);font-size:1.5rem;color:#333;}
+  #gameCanvas{display:block;touch-action:none;background:#fff;}
+  #score{
+    position:absolute;top:12px;left:0;width:100%;text-align:center;
+    font:900 44px/1 "Arial Black",sans-serif;color:#fff;
+    text-shadow:0 0 8px rgba(0,0,0,.6),
+                2px 2px 0 #000,-2px 2px 0 #000,
+                2px -2px 0 #000,-2px -2px 0 #000;
+    pointer-events:none;user-select:none;
+  }
+</style>
+</head>
+<body>
+<div id="loader">読み込み中…</div>
+<canvas id="gameCanvas"></canvas>
+<div id="score">0</div>
+<audio id="bgm" src="bgm.mp3" loop></audio>
+
+<script>
+(async()=>{
+/* ───────── 1. アセット読み込み ───────── */
+const loader=document.getElementById('loader');
+const ASSETS={images:{
+  background:'background.png',
+  zabuton1:'zabuton1.png',zabuton2:'zabuton2.png',zabuton3:'zabuton3.png',
+  start:'start_button.png',retry:'retry_button.png',gameover:'gameover.png'
+}};
+const assets={images:{}};
+try{
+  const list=await Promise.all(Object.entries(ASSETS.images).map(([k,src])=>new Promise((ok,no)=>{
+    const img=new Image();img.src=src;img.onload=()=>ok({k,img});img.onerror=no;
+  })));
+  list.forEach(({k,img})=>assets.images[k]=img);
+}catch{loader.textContent='読み込み失敗';return;}
+
+/* ───────── 2. DOM / 3. 定数 ───────── */
+const cvs=document.getElementById('gameCanvas'),ctx=cvs.getContext('2d');
+const scoreEl=document.getElementById('score'),bgm=document.getElementById('bgm');
+const W=360,H=640,ZW=64,ZH=40;
+const gravity=0.5,speedGain=0.3,TOP_MARGIN=120;
+const MIN_OVERLAP_BASE=0.35;
+const WIND_MAX_BASE=1.8,WIND_PERIOD=4000,WIND_DURATION=1500;
+
+/* ───────── 4. 状態変数 ───────── */
+let state='start',stack=[],score=0,idx=-1;
+const order=['zabuton1','zabuton2','zabuton3'];
+const current={x:0,y:0,dx:3,dy:0,width:ZW,height:ZH,img:null,dropping:false};
+let wind=0,windPhase=0,nextGust=Date.now()+WIND_PERIOD;
+let gust = 0; // ← これをここに追加！
+let yOffset=0;
+
+/* ───────── 5. 難度係数 diff() だけを書き替え ─────────
+   40段目から 10段毎に +0.15 (例: 40〜49→1.15, 50〜59→1.30 … 最大 1.75) */
+function diff(){
+  const level=Math.max(Math.floor((score-40)/10)+1,0);   // 40枚未満:0
+  return 1+Math.min(level*0.15,0.75);                    // 上限 1.75
+}
+
+/* ───────── 6. その他のヘルパー ───────── */
+function tilt(i){
+  const moveSpeedBoost = 1 + Math.floor(score / 10) * 0.3;
+  const baseTilt = Math.min(3 + 0.15 * i, 8) * moveSpeedBoost * (i % 2 ? -1 : 1);
+  const windTilt = wind * 2;
+  return (baseTilt + windTilt) * Math.PI / 180;
+}
+/* 画面リサイズ */
+function resize(){
+  const s=Math.min(innerWidth/W,innerHeight/H);
+  cvs.width=W;cvs.height=H;
+  Object.assign(cvs.style,{width:`${W*s}px`,height:`${H*s}px`,
+    left:`${(innerWidth-W*s)/2}px`,top:`${(innerHeight-H*s)/2}px`,position:'absolute'});
+}
+addEventListener('resize',resize);resize();
+
+/* UI矩形 */
+const startBtn={img:assets.images.start ,w:150,h:50,x:(W-150)/2,y:(H-50)/2};
+const retryBtn={img:assets.images.retry ,w:150,h:50,x:(W-150)/2,y:(H-50)/2};
+const gameUi  ={img:assets.images.gameover,w:300,h:80,x:(W-300)/2,y:(H-80)/2-60};
+
+/* ───────── 7. ゲームロジック ───────── */
+function resetCurrent(){
+  idx = (idx + 1) % order.length;
+  const jitter = (Math.random() - 0.5) * 4;
+  const base = 3 + stack.length * speedGain;
+
+  // 10枚ごとに最大速度アップ
+  const speedLevel = Math.floor(score / 10); // 0, 1, 2, ...
+  const max = (10 + speedLevel * 2) * diff(); // 10, 12, 14, ... × diff()
+
+  Object.assign(current, {
+    img: assets.images[order[idx]],
+    x: (W - ZW) / 2 + jitter,
+    y: 40,
+    dx: (Math.random() < 0.5 ? -1 : 1) * Math.min(base, max),
+    dy: 0,
+    dropping: false
+  });
+}
+function scrollIfNeeded(){
+  if(!stack.length)return;
+  const top=Math.min(...stack.map(z=>z.y));
+  if(top>=TOP_MARGIN)return;
+  const sh=TOP_MARGIN-top;
+  stack.forEach(z=>z.y+=sh); current.y+=sh;
+  stack=stack.filter(z=>z.y<H+ZH*2);
+}
+function startGame(){
+  state='playing';stack=[];score=0;scoreEl.textContent='0';idx=-1;
+  resetCurrent();bgm.currentTime=0;bgm.play();
+  wind=0;nextGust=Date.now()+WIND_PERIOD;
+}
+function gameOver(){
+  state='gameover';bgm.pause();
+  stack.forEach(z=>{z.vx=Math.random()*4-2;z.vy=-6-Math.random()*4;z.vrot=Math.random()*0.06-0.03;z.angle=0;});
+}
+
+/* ───────── 8. 入力 ───────── */
+cvs.addEventListener('pointerdown', () => {
+  if (state === 'start') {
+    startGame();
+  } else if (state === 'gameover') {
+    startGame();
+  } else if (state === 'playing' && !current.dropping) {
+    current.dropping = true;
+    current.dy = 0;
+  }
+});
+/* ───────── 9. 更新 ───────── */
+function update() {
+  const now = Date.now();
+
+// ── 風と突風の処理 ──
+if (now >= nextGust) {
+  windPhase = 0;
+  nextGust = now + WIND_PERIOD + Math.random() * 3000;
+
+  if (Math.random() < 0.6) {
+    gust = (Math.random() < 0.5 ? -1 : 1) * (1.5 + Math.random() * 1.5);
+    setTimeout(() => { gust = 0; }, 800 + Math.random() * 1000);
+  }
+}
+
+// 段数に応じて風力を強化（10段ごとに20%ずつ上昇）
+const windLevel = Math.floor(score / 10); // 例: 0,1,2,...
+const windStrengthMultiplier = 1 + windLevel * 0.2;
+
+const windMax = WIND_MAX_BASE * windStrengthMultiplier * diff();
+
+if ((nextGust - now) < WIND_DURATION) {
+  windPhase += Math.PI / 30;
+  wind = windMax * Math.sin(windPhase) + gust;
+} else {
+  wind *= 0.96;
+  if (Math.abs(wind) < 0.02) wind = 0;
+}
+
+  // ── プレイ中の処理 ──
+  if (state === 'playing') {
+    if (!current.dropping) {
+      current.x += current.dx + wind;
+      if (current.x < 0) {
+        current.x = 0;
+        current.dx = Math.abs(current.dx);
+      } else if (current.x + ZW > W) {
+        current.x = W - ZW;
+        current.dx = -Math.abs(current.dx);
+      }
+    } else {
+      current.dy += gravity;
+      current.y += current.dy;
+
+      const targetY = stack.length ? stack[stack.length - 1].y - ZH / 2 : H - ZH;
+      if (current.y + ZH >= targetY + ZH) {
+        current.y = targetY;
+        const lastX = stack.length ? stack[stack.length - 1].x : (W - ZW) / 2;
+        const overlap = Math.min(current.x + ZW, lastX + ZW) - Math.max(current.x, lastX);
+        const need = MIN_OVERLAP_BASE + Math.min(Math.floor((score - 40) / 10) * 0.02, 0.2);
+        if (overlap <= 0 || overlap / ZW < need) return gameOver();
+        stack.push({ x: current.x, y: current.y, img: current.img, vx: 0, vy: 0, angle: 0, vrot: 0 });
+        score++;
+        scoreEl.textContent = score;
+        scrollIfNeeded();
+        resetCurrent();
+      }
+    }
+  }
+
+  // ── ゲームオーバーの物理演出 ──
+  else if (state === 'gameover') {
+    const g = 0.4;
+    stack.forEach(z => {
+      z.vy += g;
+      z.x += z.vx;
+      z.y += z.vy;
+      z.angle += z.vrot;
+    });
+  }
+
+  // ── カメラ制御 ──
+  const top = stack.length ? Math.min(...stack.map(z => z.y)) : current.y;
+  const desired = top < 100 ? -(100 - top) : 0;
+  yOffset += (desired - yOffset) * 0.1;
+}
+
+/* ───────── 10. 描画 ───────── */
+function draw(){
+  ctx.clearRect(0,0,W,H);
+  ctx.save();ctx.translate(0,yOffset);
+  ctx.drawImage(assets.images.background,0,0,W,H);
+
+  stack.forEach((z,i)=>{
+    const x0=z.x+ZW/2,y0=z.y+ZH/2,a=state==='gameover'?z.angle:tilt(i);
+    ctx.save();ctx.translate(x0,y0);ctx.rotate(a);
+    ctx.fillStyle='rgba(0,0,0,0.25)';ctx.fillRect(-ZW/2+3,-ZH/2+3,ZW,ZH);
+    ctx.drawImage(z.img,-ZW/2,-ZH/2,ZW,ZH);ctx.restore();
+  });
+
+  if(state==='playing'){
+    const i=stack.length,x0=current.x+ZW/2,y0=current.y+ZH/2,a=tilt(i);
+    ctx.save();ctx.translate(x0,y0);ctx.rotate(a);
+    ctx.fillStyle='rgba(0,0,0,0.25)';ctx.fillRect(-ZW/2+3,-ZH/2+3,ZW,ZH);
+    ctx.drawImage(current.img,-ZW/2,-ZH/2,ZW,ZH);ctx.restore();
+  }
+  ctx.restore();
+
+  if(state==='start')ctx.drawImage(startBtn.img,startBtn.x,startBtn.y,startBtn.w,startBtn.h);
+  else if(state==='gameover'){
+    ctx.drawImage(gameUi.img,gameUi.x,gameUi.y,gameUi.w,gameUi.h);
+    ctx.drawImage(retryBtn.img,retryBtn.x,retryBtn.y,retryBtn.w,retryBtn.h);
+  }
+}
+
+/* ───────── 11. ループ ───────── */
+function loop(){update();draw();requestAnimationFrame(loop);}
+loop();
+})();
+</script>
+</body>
+</html>
